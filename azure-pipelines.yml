@@ -16,11 +16,11 @@ steps:
 
 - bash: |
     git diff --name-only HEAD~1 HEAD > changed_files.txt
-    if grep -q "^lambda1/" changed_files.txt; then
+    if grep -q "^lambda_001/" changed_files.txt; then
       echo "##vso[task.setvariable variable=lambda1Changed]true"
     fi
 
-    if grep -q "^lambda2/" changed_files.txt; then
+    if grep -q "^lambda_002/" changed_files.txt; then
       echo "##vso[task.setvariable variable=lambda2Changed]true"
     fi
 
@@ -28,6 +28,9 @@ steps:
 
     echo "##[section]Detected changes in the following files:"
   displayName: 'Detect Changed Files'
+
+
+
 
 # Display environment information
 - script: |
