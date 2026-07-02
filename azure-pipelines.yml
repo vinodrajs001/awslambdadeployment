@@ -1,1 +1,35 @@
+trigger:
+  - main
 
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  buildConfiguration: 'Release'
+
+steps:
+# Checkout source code
+- checkout: self
+
+# Display environment information
+- script: |
+    echo "Building application..."
+    echo "Branch: $(Build.SourceBranchName)"
+  displayName: 'Print Build Info'
+
+# Example build step
+- script: |
+    echo "Run build commands here"
+  displayName: 'Build'
+
+# Example test step
+- script: |
+    echo "Run tests here"
+  displayName: 'Test'
+
+# Publish artifacts
+- task: PublishBuildArtifacts@1
+  inputs:
+    PathtoPublish: '$(Build.SourcesDirectory)'
+    ArtifactName: 'drop'
+  displayName: 'Publish Artifacts'
