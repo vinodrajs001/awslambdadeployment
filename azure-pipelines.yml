@@ -7,9 +7,17 @@ pool:
 variables:
   buildConfiguration: 'Release'
 
+
+
 steps:
 # Checkout source code
 - checkout: self
+  fetchDepth: "0"
+
+- bash: |
+    git diff --name-only HEAD~1 HEAD > changed_files.txt
+    echo "##[section]Starting build process"
+  displayName: 'Start Build Process'
 
 # Display environment information
 - script: |
