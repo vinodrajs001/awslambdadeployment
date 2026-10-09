@@ -1,56 +1,206 @@
-trigger:
-  - main
+# Azure DevOps multi-stage Terraform pipeline
+#
+#  Auth -> Analysis -> Security -> Validate -> Plan (3 parallel stages)
+#       -> Approve dev -> Apply dev -> Approve nexttest -> Apply nexttest
+#       -> Approve oat -> Apply oat -> Approve st -> Apply st -> Approve live -> Apply live
+#
+# Phase 1: enableTerraform = false, enableApprovals = false  -> renders and runs with echo steps only.
+# Phase 2: set both to true once the <placeholders> below are filled in.
+# Step logic lives in templates/terraform.yml.
 
-pool:
-  vmImage: 'ubuntu-latest'
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - terraform/*
+
+pr: none
+
+parameters:
+  - name: enableTerraform
+    displayName: Run real Terraform commands (false = echo only)
+    type: boolean
+    default: false
+  - name: enableApprovals
+    displayName: Wait for manual approvals (false = auto-pass)
+    type: boolean
+    default: false
+
+  # Environments in deployment order. dependsOn = stages the Approve stage waits for.
+  - name: environments
+    type: object
+    default:
+      - name: dev
+        displayName: dev
+        serviceConnection: <sc-dev>
+        dependsOn: [Plan_DevNextTestSt]
+      - name: nexttest
+        displayName: nexttest
+        serviceConnection: <sc-nexttest>
+        dependsOn: [Apply_dev]
+      - name: oat
+        displayName: oat
+        serviceConnection: <sc-oat>
+        dependsOn: [Apply_nexttest, Plan_oat]
+      - name: st
+        displayName: st
+        serviceConnection: <sc-st>
+        dependsOn: [Apply_oat]
+      - name: live
+        displayName: live
+        serviceConnection: <sc-live>
+        dependsOn: [Apply_st, Plan_live]
+
+  # Plan stages. Environments sharing a service connection/pool can share a stage (one job each).
+  - name: planStages
+    type: object
+    default:
+      - stage: Plan_DevNextTestSt
+        displayName: Plan Dev, Nexttest, St
+        environments:
+          - { name: dev,      serviceConnection: <sc-dev> }
+          - { name: nexttest, serviceConnection: <sc-nexttest> }
+          - { name: st,       serviceConnection: <sc-st> }
+      - stage: Plan_oat
+        displayName: Plan OAT
+        environments:
+          - { name: oat, serviceConnection: <sc-oat> }
+      - stage: Plan_live
+        displayName: Plan Live
+        environments:
+          - { name: live, serviceConnection: <sc-live> }
 
 variables:
-  buildConfiguration: 'Release'
+  terraformVersion: 1.9.8
+  workingDir: $(System.DefaultWorkingDirectory)/terraform
+  tfStateResourceGroup: <rg-tfstate>
+  tfStateStorageAccount: <sttfstate>
+  tfStateContainer: tfstate
 
+pool:
+  vmImage: ubuntu-latest
 
+stages:
+  # ----------------------------------------------------------------- AUTH
+  - stage: Auth
+    displayName: Auth
+    jobs:
+      - job: CheckServiceConnections
+        displayName: Check service connections
+        steps:
+          - ${{ each env in parameters.environments }}:
+              - template: templates/terraform.yml
+                parameters:
+                  action: auth
+                  envName: ${{ env.name }}
+                  serviceConnection: ${{ env.serviceConnection }}
+                  enabled: ${{ parameters.enableTerraform }}
 
-steps:
-# Checkout source code
-- checkout: self
-  fetchDepth: "0"
+  # ------------------------------------------------------------- ANALYSIS
+  - stage: Analysis
+    displayName: Analysis
+    dependsOn: Auth
+    jobs:
+      - job: Format
+        steps:
+          - template: templates/terraform.yml
+            parameters:
+              action: fmt
+              enabled: ${{ parameters.enableTerraform }}
+      - job: Lint
+        steps:
+          - template: templates/terraform.yml
+            parameters:
+              action: lint
+              enabled: ${{ parameters.enableTerraform }}
 
-- bash: |
-    git diff --name-only HEAD~1 HEAD > changed_files.txt
-    if grep -q "^lambda_001/" changed_files.txt; then
-      echo "##vso[task.setvariable variable=lambda1Changed]true"
-    fi
+  # ------------------------------------------------------------- SECURITY
+  - stage: Security
+    displayName: Security
+    dependsOn: Analysis
+    jobs:
+      - job: SecurityScan
+        steps:
+          - template: templates/terraform.yml
+            parameters:
+              action: scan
+              enabled: ${{ parameters.enableTerraform }}
 
-    if grep -q "^lambda_002/" changed_files.txt; then
-      echo "##vso[task.setvariable variable=lambda2Changed]true"
-    fi
+  # ------------------------------------------------------------- VALIDATE
+  - stage: Validate
+    displayName: Validate
+    dependsOn: Security
+    jobs:
+      - ${{ each env in parameters.environments }}:
+          - job: Validate_${{ env.name }}
+            displayName: Validate ${{ env.name }}
+            steps:
+              - template: templates/terraform.yml
+                parameters:
+                  action: validate
+                  envName: ${{ env.name }}
+                  serviceConnection: ${{ env.serviceConnection }}
+                  enabled: ${{ parameters.enableTerraform }}
 
-    cat changed_files.txt
+  # ----------------------------------------------------------------- PLAN
+  - ${{ each plan in parameters.planStages }}:
+      - stage: ${{ plan.stage }}
+        displayName: ${{ plan.displayName }}
+        dependsOn: Validate
+        jobs:
+          - ${{ each env in plan.environments }}:
+              - job: Plan_${{ env.name }}
+                displayName: Plan ${{ env.name }}
+                steps:
+                  - template: templates/terraform.yml
+                    parameters:
+                      action: plan
+                      envName: ${{ env.name }}
+                      serviceConnection: ${{ env.serviceConnection }}
+                      enabled: ${{ parameters.enableTerraform }}
 
-    echo "##[section]Detected changes in the following files:"
-  displayName: 'Detect Changed Files'
+  # ------------------------------------------------- APPROVE + APPLY CHAIN
+  - ${{ each env in parameters.environments }}:
+      - stage: Approve_${{ env.name }}
+        displayName: Approve ${{ env.displayName }}
+        dependsOn: ${{ env.dependsOn }}
+        jobs:
+          - ${{ if eq(parameters.enableApprovals, true) }}:
+              - job: WaitForApproval
+                displayName: Manual approval (${{ env.name }})
+                pool: server                       # agentless job
+                timeoutInMinutes: 1500
+                steps:
+                  - task: ManualValidation@0
+                    timeoutInMinutes: 1440
+                    inputs:
+                      notifyUsers: <approver1@example.com>;<approver2@example.com>
+                      instructions: Review the Terraform plan for ${{ env.name }} (artifact tfplan-${{ env.name }}) and approve.
+                      onTimeout: reject
+          - ${{ else }}:
+              - job: AutoApprove
+                displayName: Auto-approve (${{ env.name }}) - placeholder
+                steps:
+                  - script: echo "[placeholder] approval for ${{ env.name }}"
 
-
-
-
-# Display environment information
-- script: |
-    echo "Building application..."
-    echo "Branch: $(Build.SourceBranchName)"
-  displayName: 'Print Build Info'
-
-# Example build step
-- script: |
-    echo "Run build commands here"
-  displayName: 'Build'
-
-# Example test step
-- script: |
-    echo "Run tests here"
-  displayName: 'Test'
-
-# Publish artifacts
-- task: PublishBuildArtifacts@1
-  inputs:
-    PathtoPublish: '$(Build.SourcesDirectory)'
-    ArtifactName: 'drop'
-  displayName: 'Publish Artifacts'
+      - stage: Apply_${{ env.name }}
+        displayName: Apply ${{ env.displayName }}
+        dependsOn: Approve_${{ env.name }}
+        jobs:
+          - deployment: Apply
+            displayName: Apply ${{ env.name }}
+            environment: ${{ env.name }}
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - template: /templates/terraform.yml
+                      parameters:
+                        action: apply
+                        envName: ${{ env.name }}
+                        serviceConnection: ${{ env.serviceConnection }}
+                        enabled: ${{ parameters.enableTerraform }}
