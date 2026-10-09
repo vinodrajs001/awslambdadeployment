@@ -75,6 +75,8 @@ parameters:
           - { name: live, serviceConnection: <sc-live> }
 
 variables:
+  # Local switch: 'false' = plain jobs (no AZDO Environments needed), 'true' = deployment jobs on environments
+  useEnvironments: 'false'
   terraformVersion: 1.9.8
   workingDir: $(System.DefaultWorkingDirectory)/terraform
   tfStateResourceGroup: <rg-tfstate>
@@ -191,16 +193,27 @@ stages:
         displayName: Apply ${{ env.displayName }}
         dependsOn: Approve_${{ env.name }}
         jobs:
-          - deployment: Apply
-            displayName: Apply ${{ env.name }}
-            environment: ${{ env.name }}
-            strategy:
-              runOnce:
-                deploy:
-                  steps:
-                    - template: /templates/terraform.yml
-                      parameters:
-                        action: apply
-                        envName: ${{ env.name }}
-                        serviceConnection: ${{ env.serviceConnection }}
-                        enabled: ${{ parameters.enableTerraform }}
+          - ${{ if eq(variables.useEnvironments, 'true') }}:
+              - deployment: Apply
+                displayName: Apply ${{ env.name }}
+                environment: ${{ env.name }}
+                strategy:
+                  runOnce:
+                    deploy:
+                      steps:
+                        - template: /templates/terraform.yml
+                          parameters:
+                            action: apply
+                            envName: ${{ env.name }}
+                            serviceConnection: ${{ env.serviceConnection }}
+                            enabled: ${{ parameters.enableTerraform }}
+          - ${{ else }}:
+              - job: Apply
+                displayName: Apply ${{ env.name }}
+                steps:
+                  - template: /templates/terraform.yml
+                    parameters:
+                      action: apply
+                      envName: ${{ env.name }}
+                      serviceConnection: ${{ env.serviceConnection }}
+                      enabled: ${{ parameters.enableTerraform }}
