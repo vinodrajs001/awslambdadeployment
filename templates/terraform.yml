@@ -1,0 +1,102 @@
+# Step template used by azure-pipelines.yml
+# action: auth | fmt | lint | scan | validate | plan | apply
+parameters:
+  - name: action
+    type: string
+  - name: envName
+    type: string
+    default: ''
+  - name: serviceConnection
+    type: string
+    default: ''
+  - name: enabled
+    type: boolean
+    default: false
+
+steps:
+  - ${{ if eq(parameters.enabled, false) }}:
+      - script: echo "[placeholder] ${{ parameters.action }} ${{ parameters.envName }}"
+        displayName: ${{ parameters.action }} ${{ parameters.envName }} (placeholder)
+      # keep artifacts present so the stage graph looks the same in placeholder mode
+      - ${{ if eq(parameters.action, 'plan') }}:
+          - script: echo "placeholder plan for ${{ parameters.envName }}" > $(Build.ArtifactStagingDirectory)/tfplan
+            displayName: Create placeholder plan
+          - publish: $(Build.ArtifactStagingDirectory)/tfplan
+            artifact: tfplan-${{ parameters.envName }}
+      - ${{ if eq(parameters.action, 'scan') }}:
+          - script: echo "placeholder scan report" > $(Build.ArtifactStagingDirectory)/security-report.txt
+            displayName: Create placeholder report
+          - publish: $(Build.ArtifactStagingDirectory)/security-report.txt
+            artifact: security-report
+
+  - ${{ else }}:
+      - checkout: self
+      - script: |
+          curl -fsSLo tf.zip https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip
+          sudo unzip -o tf.zip -d /usr/local/bin && rm tf.zip
+          terraform version
+        displayName: Install Terraform $(terraformVersion)
+
+      - ${{ if eq(parameters.action, 'fmt') }}:
+          - script: terraform fmt -check -recursive
+            displayName: Terraform fmt
+            workingDirectory: $(workingDir)
+
+      - ${{ if eq(parameters.action, 'lint') }}:
+          - script: |
+              curl -fsSL https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+              tflint --init && tflint --recursive
+            displayName: TFLint
+            workingDirectory: $(workingDir)
+
+      - ${{ if eq(parameters.action, 'scan') }}:
+          - script: |
+              pip install --quiet checkov
+              checkov -d . --framework terraform --soft-fail \
+                --output cli --output junitxml --output-file-path $(Build.ArtifactStagingDirectory)
+            displayName: Checkov scan
+            workingDirectory: $(workingDir)
+          - publish: $(Build.ArtifactStagingDirectory)
+            artifact: security-report
+
+      - ${{ if in(parameters.action, 'auth', 'validate', 'plan', 'apply') }}:
+          - ${{ if eq(parameters.action, 'apply') }}:
+              - download: current
+                artifact: tfplan-${{ parameters.envName }}
+          - task: AzureCLI@2
+            displayName: Terraform ${{ parameters.action }} ${{ parameters.envName }}
+            inputs:
+              azureSubscription: ${{ parameters.serviceConnection }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              workingDirectory: $(workingDir)
+              inlineScript: |
+                set -e
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_OIDC_TOKEN=$idToken
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                export ARM_USE_OIDC=true
+                ENV=${{ parameters.envName }}
+                case "${{ parameters.action }}" in
+                  auth)
+                    az account show -o table ;;
+                  validate)
+                    terraform init -backend=false
+                    terraform validate ;;
+                  plan|apply)
+                    terraform init \
+                      -backend-config="resource_group_name=$(tfStateResourceGroup)" \
+                      -backend-config="storage_account_name=$(tfStateStorageAccount)" \
+                      -backend-config="container_name=$(tfStateContainer)" \
+                      -backend-config="key=$ENV.tfstate"
+                    if [ "${{ parameters.action }}" = "plan" ]; then
+                      terraform plan -input=false -var-file="environments/$ENV.tfvars" -out="$(Build.ArtifactStagingDirectory)/tfplan"
+                    else
+                      terraform apply -input=false "$(Pipeline.Workspace)/tfplan-$ENV/tfplan"
+                    fi ;;
+                esac
+          - ${{ if eq(parameters.action, 'plan') }}:
+              - publish: $(Build.ArtifactStagingDirectory)/tfplan
+                artifact: tfplan-${{ parameters.envName }}
